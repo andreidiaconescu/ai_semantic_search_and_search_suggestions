@@ -594,7 +594,7 @@ local = ["sentence-transformers>=3.0", "torch>=2.0"]
 
 Each phase has a clear exit criterion — don't move to the next phase until the current one's criterion is met. Phases 1–4 can mostly be built and tested locally with Docker before touching any commercial API, which keeps early iteration free and fast.
 
-### Phase 1 — Environment & Infrastructure Setup
+### Phase 1 — Environment & Infrastructure Setup ✅ DONE
 
 **Goal:** a running Postgres instance with pgvector installed, and a Python project skeleton that everything else plugs into.
 
@@ -608,7 +608,9 @@ Tasks:
 
 Deliverables: `docker-compose.yml` (Postgres + app), `pyproject.toml`, `.env.example`, empty `migrations/` with the extension-creation migration checked in, CI config running on every push.
 
-Exit criteria: `docker compose up` gives a Postgres instance with `vector` extension enabled, reachable from a local Python `psycopg` connection; CI passes on an empty test suite.
+**Status: implemented** (commit `be46132`, 2026-08-07). Delivered: `docker-compose.yml` with dev + test Postgres instances on `pgvector/pgvector:pg16`, `.env.example`, a plain-`.sql` migration runner (`migrations/runner.py`) with `migrations/0001_enable_vector_extension.sql` checked in, a `requirements*.txt`-based Python skeleton (base + optional `local`/`openai`/`voyage`/`dev` extras, per §10) in place of `pyproject.toml` optional-dependency groups, a `tests/` scaffold with a passing smoke test, and both GitHub Actions and GitLab CI configs kept in sync.
+
+Exit criteria: `docker compose up` gives a Postgres instance with `vector` extension enabled, reachable from a local Python `psycopg` connection; CI passes on an empty test suite. — **Met.**
 
 Pitfalls: managed Postgres providers vary in whether pgvector is pre-approved — check this before committing to a cloud provider, since some require opening a support ticket to allow-list extensions. Pin the pgvector version (`v0.8.0` or later) — index syntax and available operators have changed across versions.
 
