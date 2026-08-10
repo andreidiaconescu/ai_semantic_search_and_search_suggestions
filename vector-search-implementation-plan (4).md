@@ -86,7 +86,7 @@ The core idea: **the embedding provider is a config value, not a code dependency
                                                           ▼
                                               ┌────────────────────────┐
                                               │ PostgreSQL + pgvector  │
-                                              │ (HNSW index, cosine)   │
+                                              │ (HNSW, inner product)  │
                                               └────────────────────────┘
                                                           ▲
                                                           │
@@ -123,6 +123,9 @@ docker run -d --name pgvec \
 ### 3.2 Enable extension
 
 ```sql
+-- Registers the `vector` type and its distance operators (<=>, <->, <#>)
+-- with this database — a one-time, per-database prerequisite for every
+-- table/index/query in the rest of this document.
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
@@ -131,34 +134,70 @@ CREATE EXTENSION IF NOT EXISTS vector;
 Design so the vector dimension is fixed per table (pgvector requires this). Keep provider/model metadata so you can safely re-embed and compare.
 
 ```sql
+-- The single source of truth for original documents. One row per ingested
+-- document, independent of any embedding model — this is what gets re-chunked
+-- and re-embedded whenever a new/different model is adopted (see §8), so its
+-- `content` must always be enough to fully reconstruct the embeddings tables.
 CREATE TABLE documents (
-    id          BIGSERIAL PRIMARY KEY,
-    source_uri  TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    metadata    JSONB DEFAULT '{}',
-    created_at  TIMESTAMPTZ DEFAULT now()
+    id          BIGSERIAL PRIMARY KEY,      -- stable internal identifier; referenced by every embeddings table as document_id, and returned on every search result (§7) so the app can trace a match back to its source
+    source_uri  TEXT NOT NULL,              -- where this document came from (file path, URL, ticket ID, etc.) — used for dedupe-on-ingest decisions (§Phase 4) and shown/returned alongside search results
+    content     TEXT NOT NULL,              -- the full original text, kept independently of any chunking/embedding — required because embeddings can't be converted between models; re-embedding always re-derives chunks from this column (§8)
+    metadata    JSONB DEFAULT '{}',         -- free-form application fields (tags, tenant_id, access-control flags, etc.); add real columns instead of relying on this for anything that needs to be indexed/filtered efficiently at query time (§Phase 5)
+    created_at  TIMESTAMPTZ DEFAULT now(),  -- ingestion timestamp, useful for auditing and for date-range filtering at query time; never changes after the row is inserted
+    updated_at  TIMESTAMPTZ DEFAULT now()   -- last-modified timestamp, auto-refreshed on every UPDATE by the set_updated_at trigger below (e.g. content/metadata edits on re-ingestion, §Phase 4) — do not set this manually from application code
 );
 
--- One embeddings table per model/dimension in use.
+-- One embeddings table per model/dimension in use (see §2 "one Postgres table
+-- per embedding model/dimension" and the note below on why vectors from
+-- different models must never share a table).
 -- Example: 384-dim local model (bge-small) and 1536-dim commercial model.
 CREATE TABLE embeddings_bge_small (
-    document_id BIGINT REFERENCES documents(id) ON DELETE CASCADE,
-    chunk_id    INT NOT NULL,
-    chunk_text  TEXT NOT NULL,
-    embedding   vector(384) NOT NULL,
-    model_id    TEXT NOT NULL DEFAULT 'bge-small-en-v1.5',
-    PRIMARY KEY (document_id, chunk_id)
+    document_id BIGINT REFERENCES documents(id) ON DELETE CASCADE, -- FK back to the source document; ON DELETE CASCADE means deleting a document automatically removes all of its chunks/vectors here — no orphaned embeddings to clean up manually
+    chunk_id    INT NOT NULL,               -- position of this chunk within its document (0, 1, 2, ...), assigned by the chunker (§6); combined with document_id this uniquely identifies a chunk and lets re-ingestion delete-and-replace a document's old chunks cleanly (§Phase 4)
+    chunk_text  TEXT NOT NULL,              -- the literal chunk of text that was embedded — stored so search results (§7) can return matched text directly without a second lookup/re-chunk of `documents.content`
+    embedding   vector(384) NOT NULL,       -- the actual embedding vector for chunk_text, produced by this table's model; dimension (384) is fixed per table because pgvector requires a fixed vector size per column, and it must exactly match the owning model's output dimension (bge-small-en-v1.5 here)
+    model_id    TEXT NOT NULL DEFAULT 'bge-small-en-v1.5', -- records which exact model/version produced this vector; the table name already implies the model, but this column keeps that fact queryable/auditable and catches any accidental cross-model writes into the wrong table
+    created_at  TIMESTAMPTZ DEFAULT now(),  -- when this chunk/vector was first written — useful for auditing ingestion runs and index-growth tracking (§Phase 7)
+    updated_at  TIMESTAMPTZ DEFAULT now(),  -- last-modified timestamp, auto-refreshed on every UPDATE by the set_updated_at trigger below (e.g. re-embedding a chunk in place) — do not set this manually from application code
+    PRIMARY KEY (document_id, chunk_id)     -- a document's chunks are numbered from 0, so (document_id, chunk_id) is naturally unique and doubles as the natural key for upserts during re-ingestion
 );
 
 CREATE TABLE embeddings_openai_small (
-    document_id BIGINT REFERENCES documents(id) ON DELETE CASCADE,
-    chunk_id    INT NOT NULL,
-    chunk_text  TEXT NOT NULL,
-    embedding   vector(1536) NOT NULL,
-    model_id    TEXT NOT NULL DEFAULT 'text-embedding-3-small',
-    PRIMARY KEY (document_id, chunk_id)
+    document_id BIGINT REFERENCES documents(id) ON DELETE CASCADE, -- same role as in embeddings_bge_small: link back to the source document, cascading deletes with it
+    chunk_id    INT NOT NULL,               -- same role as in embeddings_bge_small: this chunk's position within its document
+    chunk_text  TEXT NOT NULL,              -- same role as in embeddings_bge_small: the literal text that was embedded, returned directly in search results
+    embedding   vector(1536) NOT NULL,      -- dimension (1536) matches OpenAI text-embedding-3-small's output — different from embeddings_bge_small's 384, which is exactly why this must be a separate table rather than a shared one (mixing dimensions/vector spaces in one similarity search is meaningless, see the warning below)
+    model_id    TEXT NOT NULL DEFAULT 'text-embedding-3-small', -- same role as in embeddings_bge_small: records the exact model/version, for auditability and safe multi-model migration/comparison (§8)
+    created_at  TIMESTAMPTZ DEFAULT now(),  -- same role as in embeddings_bge_small: when this chunk/vector was first written
+    updated_at  TIMESTAMPTZ DEFAULT now(),  -- same role as in embeddings_bge_small: auto-refreshed on every UPDATE by the set_updated_at trigger below
+    PRIMARY KEY (document_id, chunk_id)     -- same role as in embeddings_bge_small: natural key over a document's ordered chunks
 );
+
+-- Postgres has no built-in "ON UPDATE CURRENT_TIMESTAMP" (unlike MySQL), so
+-- automatic updated_at maintenance requires a trigger function attached to
+-- every table that has the column. One shared function, reused via one
+-- trigger per table, keeps this from being duplicated per table.
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger AS $$
+BEGIN
+    NEW.updated_at = now(); -- stamp the row with the current time on every UPDATE, overriding whatever the caller sent (or didn't send) for updated_at
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER documents_set_updated_at
+    BEFORE UPDATE ON documents          -- fires before any UPDATE to documents (e.g. content/metadata changes on re-ingestion, §Phase 4) so updated_at reflects the write that's about to commit
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER embeddings_bge_small_set_updated_at
+    BEFORE UPDATE ON embeddings_bge_small -- fires before any UPDATE to a chunk/vector row in this table (e.g. in-place re-embedding rather than delete+reinsert)
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER embeddings_openai_small_set_updated_at
+    BEFORE UPDATE ON embeddings_openai_small -- same purpose as embeddings_bge_small_set_updated_at, scoped to this table
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 ```
+
+> **`updated_at` is maintained automatically, not by application code.** The `set_updated_at()` trigger function overwrites `updated_at` with `now()` on every `UPDATE`, regardless of what value (if any) the application supplied — this guarantees the column is trustworthy even if a caller forgets to set it. Any new table added later that needs the same behavior just needs its own `CREATE TRIGGER ... BEFORE UPDATE ... EXECUTE FUNCTION set_updated_at();` — the function itself doesn't need to change.
 
 > Alternative if you want a single table: store dimension as the max needed and zero-pad smaller vectors — **don't do this**. It corrupts cosine similarity. Separate tables (or separate Postgres schemas) per model is the correct approach.
 
@@ -168,14 +207,22 @@ CREATE TABLE embeddings_openai_small (
 
 Two index types in pgvector: `ivfflat` (faster build, needs pre-existing data to train) and `hnsw` (slower build, better recall/query speed, no training step). For most workloads, **use HNSW**.
 
-```sql
--- cosine distance is standard for text embeddings (normalized vectors)
-CREATE INDEX ON embeddings_bge_small
-  USING hnsw (embedding vector_cosine_ops)
-  WITH (m = 16, ef_construction = 64);
+**Operator choice: inner product, not cosine.** Both providers in §4 emit unit-normalized vectors (OpenAI's API pre-normalizes its embeddings; the local `LocalEmbeddingProvider` calls `.encode(..., normalize_embeddings=True)`, §4.3). For unit-length vectors, cosine similarity and inner product produce **identical rankings** — cosine distance's extra division by `‖a‖‖b‖` is a division by `1`. Inner product (`vector_ip_ops` / `<#>`) skips that normalization step entirely, so it's cheaper per comparison at both index-build and query time, with no precision loss versus cosine. This only holds because the vectors are normalized — if you ever add a provider that doesn't normalize its output, either normalize it yourself before storing, or fall back to `vector_cosine_ops` for that table.
 
+```sql
+-- Index built on the `embedding` column of embeddings_bge_small — this is what
+-- makes `ORDER BY embedding <#> $1 LIMIT k` (§3.5) fast instead of scanning
+-- every row; `document_id`/`chunk_id`/`chunk_text`/`model_id` don't need an
+-- index here since they're not what similarity search orders by.
+CREATE INDEX ON embeddings_bge_small
+  USING hnsw (embedding vector_ip_ops)     -- vector_ip_ops: build the graph for inner product — equivalent ranking to cosine here because bge-small-en-v1.5's output is unit-normalized (§4.3), but cheaper per comparison (§3.5)
+  WITH (m = 16, ef_construction = 64);     -- m: graph connectivity per node; ef_construction: build-time search width — both tunable per §3.4's tuning notes
+
+-- Same purpose as above, applied to embeddings_openai_small's `embedding`
+-- column — each per-model table needs its own HNSW index, since indexes
+-- aren't shared across tables.
 CREATE INDEX ON embeddings_openai_small
-  USING hnsw (embedding vector_cosine_ops)
+  USING hnsw (embedding vector_ip_ops)     -- vector_ip_ops: inner product — equivalent ranking to cosine here because OpenAI text-embedding-3-small's output is already unit-normalized by the API
   WITH (m = 16, ef_construction = 64);
 ```
 
@@ -183,18 +230,25 @@ Tuning notes:
 - `m`: graph connectivity (default 16). Higher = better recall, more memory/build time.
 - `ef_construction`: build-time search width (default 64). Higher = better index quality, slower build.
 - At query time, set `SET hnsw.ef_search = 100;` (higher = better recall, slower query). Tune per latency budget.
-- If dataset < ~50k rows, a plain sequential scan with cosine distance is often fast enough — don't over-engineer the index for small datasets.
+- If dataset < ~50k rows, a plain sequential scan with inner product distance is often fast enough — don't over-engineer the index for small datasets.
+- If you ever store non-normalized vectors in a future table, use `vector_cosine_ops`/`<=>` for that table instead — inner product on non-normalized vectors is biased toward larger-magnitude vectors and is **not** equivalent to cosine similarity in that case.
 
 ### 3.5 Query
 
 ```sql
-SELECT document_id, chunk_text, 1 - (embedding <=> $1) AS similarity
+-- $1 is the query embedding, produced by the SAME model that owns this table
+-- (embed_query, not embed_documents — see §4.1, §7); mixing a query vector
+-- from a different model into this table's search would silently return
+-- meaningless results (§Phase 3 pitfalls).
+SELECT document_id,              -- returned so the app can fetch the full source document, its metadata, or apply access control (§3.3 note)
+       chunk_text,                -- the matched text itself, returned directly so the app doesn't need a second lookup
+       -(embedding <#> $1) AS similarity -- <#> is pgvector's NEGATIVE inner product operator (it negates so that ORDER BY ASC still means "closest first", matching <=> and <->); negating it back gives the raw dot product, which equals cosine similarity here because both vectors are unit-normalized (§3.4) — no norm division needed
 FROM embeddings_bge_small
-ORDER BY embedding <=> $1
-LIMIT 10;
+ORDER BY embedding <#> $1        -- ordering by negative inner product (ascending = most negative = largest actual dot product = closest first) is what lets the HNSW index (§3.4) satisfy this query without a full scan
+LIMIT 10;                        -- top_k — how many nearest chunks to return; configurable per §Phase 5
 ```
 
-`<=>` is the cosine distance operator in pgvector; `<->` is L2, `<#>` is negative inner product. Pick the operator matching how the model's embeddings were trained/normalized (OpenAI and most sentence-transformer models: cosine).
+`<#>` is the negative inner product operator in pgvector (chosen here because both providers store unit-normalized vectors — see §3.4's "Operator choice" note); `<=>` is cosine distance, `<->` is L2. If you introduce a table of non-normalized vectors, use `<=>` for that table instead, since `<#>`'s ranking is only equivalent to cosine similarity when the vectors are unit length.
 
 ---
 
@@ -502,10 +556,10 @@ def search(query: str, top_k: int = 10) -> list[dict]:
         cur.execute(
             f"""
             SELECT e.document_id, d.source_uri, e.chunk_id, e.chunk_text,
-                   1 - (e.embedding <=> %s) AS similarity
+                   -(e.embedding <#> %s) AS similarity
             FROM {table} e
             JOIN documents d ON d.id = e.document_id
-            ORDER BY e.embedding <=> %s
+            ORDER BY e.embedding <#> %s
             LIMIT %s
             """,
             (query_vec, query_vec, top_k),
@@ -623,14 +677,14 @@ Pitfalls: managed Postgres providers vary in whether pgvector is pre-approved �
 Tasks:
 - Create the `documents` table (§3.3) with whatever metadata columns your application actually needs (tags, access-control fields, timestamps) — don't over-design this speculatively, but don't leave out fields you already know you'll need for filtering (e.g. `tenant_id` for multi-tenant apps, since that will matter for query-time filtering later).
 - Create the first embeddings table for whichever model you'll prototype with first (local model recommended for phase 2, since it avoids API costs during schema iteration).
-- Decide the distance operator up front (`vector_cosine_ops` for normalized text embeddings — this should match how the model was trained; verify per model, don't assume) and encode that decision in the migration, not just in application code.
+- Decide the distance operator up front (`vector_ip_ops`/`<#>` for unit-normalized text embeddings, per §3.4 — inner product is faster than `vector_cosine_ops` and ranks identically as long as the model's output is normalized; verify per model, don't assume, and use `vector_cosine_ops` instead for any model that isn't normalized) and encode that decision in the migration, not just in application code.
 - Add the HNSW index (§3.4). For initial development, default `m = 16, ef_construction = 64` is fine; defer serious tuning to Phase 6 once you have real data volume and can measure recall/latency tradeoffs.
 - Write a small script that inserts synthetic rows (random vectors) at a scale close to your expected production volume (e.g. 100k rows) purely to validate that index creation completes in reasonable time and query latency is acceptable — catching this now is much cheaper than discovering it after real data is loaded.
 - Decide and document the multi-model table-naming convention (§5.1) before writing any ingestion code that depends on it.
 
 Deliverables: SQL migrations for `documents` and the first `embeddings_<model>` table with its HNSW index; a throwaway load-test script (not part of the app, just a validation tool).
 
-Exit criteria: a query against the synthetic-data table using `ORDER BY embedding <=> $1 LIMIT 10` returns in acceptable time (define "acceptable" now — e.g. p95 < 100ms — so Phase 6 has a concrete target to test against).
+Exit criteria: a query against the synthetic-data table using `ORDER BY embedding <#> $1 LIMIT 10` returns in acceptable time (define "acceptable" now — e.g. p95 < 100ms — so Phase 6 has a concrete target to test against).
 
 Pitfalls: building an HNSW index on a large table blocks other writes for a while (`CREATE INDEX CONCURRENTLY` avoids the write-lock but has its own caveats — check pgvector's docs for concurrent-build support in your installed version). Don't add multiple embedding tables until you actually need to compare/migrate models — one table is enough to start.
 
@@ -682,7 +736,7 @@ Pitfalls: chunk size/overlap tuned for one content type (e.g. long-form articles
 
 Tasks:
 - Implement `search()` and confirm it uses `embed_query`, not `embed_documents`, for the query text.
-- Add query-time filtering support if your application needs it (e.g. filter by `metadata->>'tenant_id'` or a date range) — this typically means adding a `WHERE` clause alongside the `ORDER BY ... <=>` and may need a composite index if filters are highly selective; test that the HNSW index is still used (`EXPLAIN ANALYZE`) once a `WHERE` clause is added, since some filter patterns can cause Postgres to fall back to a sequential scan.
+- Add query-time filtering support if your application needs it (e.g. filter by `metadata->>'tenant_id'` or a date range) — this typically means adding a `WHERE` clause alongside the `ORDER BY ... <#>` and may need a composite index if filters are highly selective; test that the HNSW index is still used (`EXPLAIN ANALYZE`) once a `WHERE` clause is added, since some filter patterns can cause Postgres to fall back to a sequential scan.
 - Tune `hnsw.ef_search` empirically against the latency/recall target set in Phase 2, not by guessing.
 - Add pagination/top_k configurability, and decide on a similarity-score floor if your application shouldn't show very weak matches (e.g. discard results below a cosine similarity threshold rather than always returning exactly `top_k`).
 - Add a fallback path for when the search returns zero results (common for narrow or sparse corpora) — decide whether the application should broaden the query, fall back to keyword search, or simply message "no results."
@@ -755,7 +809,7 @@ Pitfalls: waiting until a migration is urgently needed (e.g. a provider deprecat
 
 ## Summary
 
-- **Storage**: pgvector, HNSW index, one table per model dimension, cosine distance.
+- **Storage**: pgvector, HNSW index, one table per model dimension, inner product distance (equivalent to cosine on the unit-normalized vectors both providers emit, but faster — §3.4).
 - **No lock-in**: a single `EmbeddingProvider` ABC; commercial and local implementations are interchangeable via one env var.
 - **Commercial cheap option**: OpenAI `text-embedding-3-small` (or Voyage `voyage-3-lite` as a drop-in alternative).
 - **Free option**: `sentence-transformers` running `BAAI/bge-small-en-v1.5` fully offline, or Ollama + `nomic-embed-text` if you prefer an HTTP-served local model.
