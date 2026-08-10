@@ -26,12 +26,38 @@ INSERT_BATCH_SIZE = 1_000
 
 
 def random_unit_vectors(n: int, dim: int) -> np.ndarray:
+    """Generate `n` random `dim`-dimensional vectors, each L2-normalized to unit length.
+
+    Unit-normalized to realistically match what LocalEmbeddingProvider
+    produces (see embeddings/local_provider.py), since the HNSW index uses
+    inner product (§3.4 of the master plan), which only ranks like cosine
+    similarity for normalized vectors.
+
+    Args:
+        n: Number of vectors to generate.
+        dim: Length of each vector.
+
+    Returns:
+        An (n, dim) float32 array, each row a unit vector.
+    """
     vecs = np.random.default_rng().normal(size=(n, dim)).astype("float32")
     vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
     return vecs
 
 
 def insert_synthetic_documents(conn, n_documents: int) -> list[int]:
+    """Insert `n_documents` synthetic `documents` rows, batched for speed.
+
+    Each row gets a distinguishable `source_uri` ("synthetic://doc/<i>") so
+    `load_synthetic_data` can detect and skip re-loading on a later run.
+
+    Args:
+        conn: An open psycopg connection with `register_vector` applied.
+        n_documents: How many synthetic document rows to insert.
+
+    Returns:
+        The inserted rows' `id` values, in insertion order.
+    """
     doc_ids: list[int] = []
     with conn.cursor() as cur:
         for start in range(0, n_documents, INSERT_BATCH_SIZE):
@@ -52,6 +78,26 @@ def insert_synthetic_documents(conn, n_documents: int) -> list[int]:
 
 
 def insert_synthetic_embeddings(conn, doc_ids: list[int], n_chunks: int, dim: int) -> None:
+    """Generate and bulk-insert `n_chunks` synthetic embedding rows.
+
+    Spreads `n_chunks` evenly across `doc_ids` (`n_chunks // len(doc_ids)`
+    chunks per document, sequential `chunk_id`s starting at 0 per document)
+    and inserts them into `embeddings_bge_small` in batches of
+    INSERT_BATCH_SIZE rows per statement, to avoid one network round-trip
+    per row.
+
+    Args:
+        conn: An open psycopg connection with `register_vector` applied.
+        doc_ids: The `documents.id` values to attach chunks to (from
+            `insert_synthetic_documents`).
+        n_chunks: Total number of embedding rows to generate, across all
+            documents combined.
+        dim: Vector dimension to generate (must match the `embedding`
+            column's declared dimension).
+
+    Returns:
+        None. Prints how many rows were loaded when done.
+    """
     chunks_per_doc = n_chunks // len(doc_ids)
     vectors = random_unit_vectors(len(doc_ids) * chunks_per_doc, dim)
 
@@ -77,6 +123,22 @@ def insert_synthetic_embeddings(conn, doc_ids: list[int], n_chunks: int, dim: in
 
 
 def load_synthetic_data(conn, n_documents: int, n_chunks: int, dim: int) -> None:
+    """Load synthetic documents/embeddings, unless they're already present.
+
+    Idempotency check: looks for any `documents` row whose `source_uri`
+    starts with "synthetic://" and skips loading entirely if one is found,
+    so re-running this script against the same database doesn't duplicate
+    data or waste time re-generating vectors.
+
+    Args:
+        conn: An open psycopg connection with `register_vector` applied.
+        n_documents: Number of synthetic documents to insert if not already loaded.
+        n_chunks: Number of synthetic embedding rows to insert if not already loaded.
+        dim: Vector dimension to generate.
+
+    Returns:
+        None.
+    """
     with conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM documents WHERE source_uri LIKE 'synthetic://%'")
         if cur.fetchone()[0] > 0:
@@ -88,6 +150,19 @@ def load_synthetic_data(conn, n_documents: int, n_chunks: int, dim: int) -> None
 
 
 def show_query_plan(conn, dim: int) -> None:
+    """Run EXPLAIN ANALYZE on one sample query and print the plan.
+
+    Lets a human visually confirm Postgres is using the HNSW index (an
+    "Index Scan using embeddings_bge_small_embedding_idx" line) rather than
+    silently falling back to a sequential scan.
+
+    Args:
+        conn: An open psycopg connection with `register_vector` applied.
+        dim: Vector dimension of the random query vector to search with.
+
+    Returns:
+        None. Prints the EXPLAIN ANALYZE plan lines to stdout.
+    """
     query_vec = random_unit_vectors(1, dim)[0]
     with conn.cursor() as cur:
         cur.execute("SET hnsw.ef_search = 100;")
@@ -103,6 +178,16 @@ def show_query_plan(conn, dim: int) -> None:
 
 
 def measure_latency(conn, n_queries: int, dim: int) -> list[float]:
+    """Time `n_queries` nearest-neighbor searches against a fresh random query vector each.
+
+    Args:
+        conn: An open psycopg connection with `register_vector` applied.
+        n_queries: How many timed queries to run.
+        dim: Vector dimension of each random query vector.
+
+    Returns:
+        One latency per query, in milliseconds, in the order the queries ran.
+    """
     latencies = []
     with conn.cursor() as cur:
         cur.execute("SET hnsw.ef_search = 100;")
@@ -120,6 +205,21 @@ def measure_latency(conn, n_queries: int, dim: int) -> list[float]:
 
 
 def main() -> None:
+    """CLI entry point: load synthetic data (if needed), then measure and report query latency.
+
+    Parses `--url`/`--n-documents`/`--n-chunks`/`--n-queries`, loads
+    synthetic data via `load_synthetic_data`, prints an `EXPLAIN ANALYZE`
+    plan via `show_query_plan`, then times `--n-queries` queries via
+    `measure_latency` and prints p50/p95/max latency plus a PASS/FAIL line
+    against LATENCY_TARGET_MS.
+
+    Args:
+        None directly — reads `--url`/`--n-documents`/`--n-chunks`/
+        `--n-queries` from sys.argv via argparse.
+
+    Returns:
+        None.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--n-documents", type=int, default=N_DOCUMENTS)

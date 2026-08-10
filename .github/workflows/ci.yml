@@ -32,7 +32,7 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        run: pip install -r requirements-dev.txt -r requirements-openai.txt
 
       - name: Run migrations
         run: python migrations/runner.py --url "$DATABASE_URL"
@@ -41,4 +41,4 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest
+        run: pytest -m "not integration"

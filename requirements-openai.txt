@@ -1,2 +1,3 @@
 -r requirements.txt
 openai>=1.30
+tenacity>=8.0

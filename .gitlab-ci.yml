@@ -13,8 +13,8 @@ variables:
 test:
   stage: test
   before_script:
-    - pip install -r requirements-dev.txt
+    - pip install -r requirements-dev.txt -r requirements-openai.txt
   script:
     - python migrations/runner.py --url "$DATABASE_URL"
     - ruff check .
-    - pytest
+    - pytest -m "not integration"

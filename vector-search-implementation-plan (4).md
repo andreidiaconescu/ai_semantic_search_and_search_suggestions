@@ -694,7 +694,7 @@ Pitfalls: building an HNSW index on a large table blocks other writes for a whil
 
 ---
 
-### Phase 3 — Embedding Provider Abstraction Layer
+### Phase 3 — Embedding Provider Abstraction Layer ✅ DONE
 
 **Goal:** the `EmbeddingProvider` interface (§4) implemented for both a local and a commercial backend, swappable via config, with no calling code aware of which is active.
 
@@ -708,7 +708,15 @@ Tasks:
 
 Deliverables: `embeddings/base.py`, `embeddings/local_provider.py`, `embeddings/openai_provider.py` (or `voyage_provider.py`), `embeddings/factory.py`, `embeddings/mock_provider.py` for tests, unit + integration tests for all.
 
-Exit criteria: the same ingestion/query code (even if just a throwaway script at this stage) works unmodified against both providers by only changing `EMBEDDING_BACKEND`.
+**Status: implemented** (2026-08-10, uncommitted — pending review). Delivered exactly the deliverables above: `embeddings/base.py` (`EmbeddingProvider` ABC + `EmbeddingResult`), `embeddings/local_provider.py` (`BAAI/bge-small-en-v1.5`, matching §4.3), `embeddings/openai_provider.py` (`text-embedding-3-small`, matching §4.2's defensive index-sort, plus `tenacity` retry/backoff scoped to `RateLimitError`/`APIConnectionError`/`APITimeoutError` only — not auth/bad-request errors, which fail fast), `embeddings/factory.py` (`local`/`openai`/`mock` via `EMBEDDING_BACKEND`, matching §4.4), and `embeddings/mock_provider.py` (deterministic, hash-derived, unit-normalized vectors — zero network/model, used by downstream tests). Voyage was **not** implemented this phase — deliberately scoped to OpenAI-only, per an explicit user decision (`requirements-voyage.txt` stays unused).
+
+One interface addition beyond §4.1: `EmbeddingProvider` also requires a **`table_name`** class attribute (alongside `model_id`/`dimension`), fixing the table-naming bug flagged at the end of Phase 2 — `table_name_for()` (§5.1) deriving a name from `model_id` broke for `"BAAI/bge-small-en-v1.5"`. Each provider now declares its table explicitly (`LocalEmbeddingProvider.table_name = "embeddings_bge_small"`, `OpenAIEmbeddingProvider.table_name = "embeddings_openai_small"`), so Phase 4's `table_name_for()` becomes a trivial `return provider.table_name` instead of a slugifier.
+
+Tests: 5 new files (`tests/test_embeddings_base.py`, `_mock.py`, `_factory.py`, `_openai.py`, `_local.py`) — 26 tests pass, 1 correctly skipped (the real-API OpenAI test, no key available). The local-model integration test was **actually run** (not just written): it downloaded and cached `bge-small-en-v1.5` and confirmed 384-dim, unit-normalized output with the BGE query instruction prefix actually changing the embedding. The OpenAI provider's retry/backoff and defensive-sort behavior are unit-tested with a mocked client (no real network needed). A new `pytest.ini` registers an `integration` marker so real-network/real-model tests are excluded by default (`pytest -m "not integration"`, what CI runs) and opt-in otherwise. `ruff check .` is clean.
+
+Distance metric documented per this phase's own task list: both implemented providers are inner-product (`vector_ip_ops`/`<#>`), not cosine — both emit unit-normalized vectors, so this matches §3.4's Phase 2 decision. Documented in a new README "Embedding providers" section (table of `EMBEDDING_BACKEND` values, requirements, and distance metric per provider), not just code comments.
+
+Exit criteria: the same ingestion/query code (even if just a throwaway script at this stage) works unmodified against both providers by only changing `EMBEDDING_BACKEND`. — **Met, adapted.** Ingestion/query code doesn't exist until Phase 4, so this was verified at the provider layer instead: `tests/test_embeddings_factory.py` proves `EMBEDDING_BACKEND` alone (`local`/`openai`/`mock`) determines which provider class is constructed and what `model_id`/`dimension`/`table_name` it reports, with zero other code changes.
 
 Pitfalls: forgetting that query-time embedding must use the same provider (and ideally the same `embed_query`, not `embed_documents`) as was used at ingestion time — mixing vectors from different models in one similarity search silently produces meaningless results, not an error.
 
