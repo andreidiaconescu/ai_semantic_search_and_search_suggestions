@@ -670,7 +670,7 @@ Pitfalls: managed Postgres providers vary in whether pgvector is pre-approved �
 
 ---
 
-### Phase 2 — Database Schema & Indexing
+### Phase 2 — Database Schema & Indexing ✅ DONE
 
 **Goal:** finalized schema for `documents` and per-model embedding tables, with indexes tuned for the expected data volume.
 
@@ -684,7 +684,11 @@ Tasks:
 
 Deliverables: SQL migrations for `documents` and the first `embeddings_<model>` table with its HNSW index; a throwaway load-test script (not part of the app, just a validation tool).
 
-Exit criteria: a query against the synthetic-data table using `ORDER BY embedding <#> $1 LIMIT 10` returns in acceptable time (define "acceptable" now — e.g. p95 < 100ms — so Phase 6 has a concrete target to test against).
+**Status: implemented** (2026-08-10, uncommitted — pending review). Delivered: `migrations/0002_create_documents_table.sql` (`documents` table + a shared `set_updated_at()` trigger function), `migrations/0003_create_embeddings_bge_small_table.sql` (the local-model-only `embeddings_bge_small` table, 384-dim, scoped to `bge-small-en-v1.5` per the phase's own recommendation — no `embeddings_openai_small` table yet, deferred per this phase's pitfalls note), `migrations/0004_index_embeddings_bge_small_hnsw.sql` (HNSW index using `vector_ip_ops`, not `vector_cosine_ops`, matching §3.4's inner-product decision), and `migrations/loadtest_synthetic_bge_small.py` (throwaway synthetic-data + latency validation script). No `tenant_id`/extra `documents` columns were added — no known filtering requirement yet, so the schema matches §3.3 as-is (plus `updated_at`). New tests in `tests/test_schema.py` verify table columns, embedding dimension, HNSW index presence, and `updated_at` trigger behavior; all pass, and `ruff check .` is clean.
+
+One deviation flagged for Phase 3: `table_name_for()` (§5.1) derives the table name from `provider.model_id` (`"BAAI/bge-small-en-v1.5"`), which slugifies to `embeddings_BAAI_bge_small_en_v1_5` — not the `embeddings_bge_small` name actually created here (matching §3.3's hardcoded example). Phase 3 should add an explicit `table_name` attribute per provider instead of deriving it, or ingestion/query code will silently look at the wrong table.
+
+Exit criteria: a query against the synthetic-data table using `ORDER BY embedding <#> $1 LIMIT 10` returns in acceptable time (define "acceptable" now — e.g. p95 < 100ms — so Phase 6 has a concrete target to test against). — **Met.** The load-test script loaded 100,000 synthetic 384-dim unit-normalized vectors across 2,000 documents against the dev DB; `EXPLAIN ANALYZE` confirmed the HNSW index (not a sequential scan) is used; measured **p95 = 5.17ms, max = 5.43ms** — well under the 100ms target.
 
 Pitfalls: building an HNSW index on a large table blocks other writes for a while (`CREATE INDEX CONCURRENTLY` avoids the write-lock but has its own caveats — check pgvector's docs for concurrent-build support in your installed version). Don't add multiple embedding tables until you actually need to compare/migrate models — one table is enough to start.
 
