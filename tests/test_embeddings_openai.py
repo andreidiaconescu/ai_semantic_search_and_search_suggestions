@@ -5,6 +5,7 @@ import openai
 import pytest
 
 from embeddings.openai_provider import OpenAIEmbeddingProvider
+from ingest import _rows_for
 
 
 class _FakeItem:
@@ -140,6 +141,43 @@ def test_embed_query_delegates_to_embed_documents(provider):
     resp = _FakeResponse([_FakeItem(index=0, embedding=[0.7, 0.8])])
     provider.client.embeddings.create = Mock(return_value=resp)
     assert provider.embed_query("q") == [0.7, 0.8]
+
+
+def test_ingest_row_building_works_for_the_openai_path(provider):
+    """The ingest.py row-building helper produces correct rows for OpenAI-shaped output.
+
+    `embeddings_openai_small` doesn't exist as a real table yet (no
+    OPENAI_API_KEY, no need for it until commercial embeddings are
+    actually adopted — see Phase 4's plan notes), so this only proves the
+    OpenAI provider's output is correctly reattached to
+    (document_id, chunk_id) via ingest.py's `_rows_for`, the same helper
+    ingest_document/bulk_ingest_documents use for every provider — without
+    writing anything to a database.
+
+    Args:
+        provider: The `provider` fixture above (dummy-keyed, no real network).
+
+    Returns:
+        None.
+    """
+    resp = _FakeResponse(
+        [
+            _FakeItem(index=0, embedding=[0.1, 0.2]),
+            _FakeItem(index=1, embedding=[0.3, 0.4]),
+        ]
+    )
+    provider.client.embeddings.create = Mock(return_value=resp)
+
+    texts = ["first chunk", "second chunk"]
+    result = provider.embed_documents(texts)
+    keys = [(42, 0), (42, 1)]
+
+    rows = _rows_for(keys, texts, result.vectors, provider.model_id)
+
+    assert rows == [
+        (42, 0, "first chunk", [0.1, 0.2], "text-embedding-3-small"),
+        (42, 1, "second chunk", [0.3, 0.4], "text-embedding-3-small"),
+    ]
 
 
 @pytest.mark.integration

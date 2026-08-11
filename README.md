@@ -183,6 +183,7 @@ Checks `OpenAIEmbeddingProvider`. The first four tests mock `client.embeddings.c
 | `test_retries_on_retryable_error_then_succeeds` | Two simulated `RateLimitError`s followed by success still returns the correct result — proves the `tenacity` retry wiring works. |
 | `test_non_retryable_error_is_not_retried` | A simulated `AuthenticationError` propagates immediately (call count stays at 1) — retrying an unfixable error would just waste time. |
 | `test_embed_query_delegates_to_embed_documents` | `embed_query` returns the same vector `embed_documents([text])` would for that one text. |
+| `test_ingest_row_building_works_for_the_openai_path` | Proves `ingest.py`'s `_rows_for` helper reattaches OpenAI-shaped vectors to `(document_id, chunk_id)` correctly — no real network, and no write to `embeddings_openai_small` (that table doesn't exist yet; see "Ingestion" below). |
 | `test_real_openai_embedding_dimension_matches` *(integration)* | A real API call with a fixed short input returns a vector of length 1536 (`provider.dimension`). Skipped automatically unless `OPENAI_API_KEY` is set to a real key. |
 
 ### `tests/test_embeddings_local.py` *(integration)*
@@ -195,6 +196,39 @@ Checks `LocalEmbeddingProvider` against the real `sentence-transformers` model. 
 | `test_embed_documents_shape_and_normalization` | Each returned vector has length 384 and L2 norm ≈ 1. |
 | `test_query_prefix_changes_the_embedding` | `embed_query(text)` differs from `embed_documents([text]).vectors[0]` for the same raw text — proves the BGE instruction prefix is actually applied at query time, not a no-op. |
 
+### `tests/test_chunking.py`
+
+Pure unit tests of `chunking.chunk_text` — no DB, no provider, no network.
+
+| Test | What it checks |
+|---|---|
+| `test_empty_text_returns_no_chunks` | `chunk_text("")` returns `[]`. |
+| `test_short_text_returns_single_chunk` | Text shorter than `chunk_size` comes back as one unmodified chunk. |
+| `test_prefers_paragraph_boundary_over_mid_word_split` | Two paragraphs joined by `\n\n` split cleanly at the paragraph boundary, not mid-word — proves the recursive splitter's separator priority. |
+| `test_word_boundaries_are_preserved_with_whitespace_fallback` | With no paragraph/sentence separators available, the whitespace fallback still never splits a word in half. |
+| `test_consecutive_chunks_share_the_requested_overlap` | Each non-first chunk starts with the last `overlap` characters of the previous one. |
+| `test_chunk_size_must_be_positive`, `test_overlap_must_be_non_negative`, `test_overlap_must_be_less_than_chunk_size` | Invalid parameters raise `ValueError` instead of producing a nonsensical split. |
+
+### `tests/test_ingest.py`
+
+Checks `ingest.py`'s single-document path — upsert-by-`source_uri` (§ below).
+
+| Test | What it checks |
+|---|---|
+| `test_rows_for_reattaches_vectors_to_correct_keys` | The `_rows_for` helper (no DB) zips `(document_id, chunk_id)` keys back onto texts/vectors correctly. |
+| `test_ingest_document_creates_expected_chunks` *(integration)* | Ingesting a realistic sample document produces exactly the expected chunk rows in `embeddings_bge_small`, with correct `document_id`s. |
+| `test_reingesting_same_source_uri_replaces_chunks` *(integration)* | Calling `ingest_document` twice with the same `source_uri` but different content replaces the old chunks rather than accumulating both sets. |
+
+### `tests/test_bulk_ingest.py`
+
+Checks `bulk_ingest.py`'s batched multi-document path — fail-whole-batch policy (§ below). The pure-logic tests use a fake in-memory DB connection/cursor (`_FakeConnection`/`_FakeCursor`) so they never touch Postgres.
+
+| Test | What it checks |
+|---|---|
+| `test_bulk_ingest_reattaches_vectors_across_documents_and_batches` | With `batch_size=1` (forcing one `embed_documents` call per chunk), every vector still lands on the correct document/chunk — no DB, `MockEmbeddingProvider` only. |
+| `test_bulk_ingest_writes_nothing_if_any_batch_fails` | A provider that raises on its 2nd `embed_documents` call results in *nothing* being written — not even the document upserts from earlier in the same call — proving the whole operation is one all-or-nothing transaction. |
+| `test_bulk_ingest_document_ids_and_chunk_counts` *(integration)* | Bulk-ingesting a few real documents against `local` + real Postgres produces the expected row counts per `document_id`. |
+
 ### Running the integration tests
 
 Integration tests are skipped by default (`pytest -m "not integration"`, what CI runs) because they need a real model download or a real paid API call. To run them deliberately:
@@ -204,6 +238,10 @@ Integration tests are skipped by default (`pytest -m "not integration"`, what CI
 # download on first run, cached afterward):
 pip install -r requirements-local.txt
 pytest tests/test_embeddings_local.py -m integration
+
+# Ingestion against the local model + real Postgres — same prerequisite,
+# plus test_db migrated (§1-4) and TEST_DATABASE_URL exported:
+pytest tests/test_ingest.py tests/test_bulk_ingest.py -m integration
 
 # OpenAI — needs a real key (this makes a real, billed API call):
 export OPENAI_API_KEY=sk-...
@@ -219,11 +257,14 @@ Both `.github/workflows/ci.yml` and `.gitlab-ci.yml` install
 `requirements-dev.txt` + `requirements-openai.txt`, run `python
 migrations/runner.py` against a fresh Postgres service, then `pytest -m "not
 integration"` on every push/PR — so every non-integration test above always
-runs in CI. The integration tests (`test_embeddings_local.py`, and
-`test_real_openai_embedding_dimension_matches` in `test_embeddings_openai.py`)
-never run in CI (no `sentence-transformers`/`torch` installed there, no
-`OPENAI_API_KEY` configured) — they're for local, deliberate runs only (see
-above).
+runs in CI. The integration tests (`test_embeddings_local.py`,
+`test_ingest_document_creates_expected_chunks`/
+`test_reingesting_same_source_uri_replaces_chunks` in `test_ingest.py`,
+`test_bulk_ingest_document_ids_and_chunk_counts` in `test_bulk_ingest.py`,
+and `test_real_openai_embedding_dimension_matches` in
+`test_embeddings_openai.py`) never run in CI (no `sentence-transformers`/
+`torch` installed there, no `OPENAI_API_KEY` configured) — they're for
+local, deliberate runs only (see above).
 
 ## Embedding providers
 
@@ -242,7 +283,7 @@ Voyage (`voyage-3-lite`, the master plan's other commercial option) is not
 implemented yet; `requirements-voyage.txt` exists but is currently unused.
 
 Every provider's `model_id`/`dimension`/`table_name` class attributes are
-what downstream ingestion/query code (Phase 4/5) will use to pick the right
+what `storage.table_name_for()` (Phase 4) uses to pick the right
 `embeddings_<model>` table without hardcoding it — see the code comment in
 `embeddings/base.py` for why `table_name` is explicit rather than derived
 from `model_id`.
@@ -251,6 +292,61 @@ from `model_id`.
 query time** — mixing vectors from two different models in one similarity
 search silently returns meaningless results, not an error (this is called
 out as a pitfall in the master plan's Phase 3 section).
+
+## Ingestion
+
+`ingest.py` and `bulk_ingest.py` (Phase 4) turn text into stored,
+searchable chunks: `chunk_text` (`chunking.py`) → `provider.embed_documents`
+→ rows in the active provider's embeddings table (`embeddings_bge_small`
+for `local`, the only one that actually exists right now — see "Embedding
+providers" above).
+
+```python
+from ingest import ingest_document
+from bulk_ingest import bulk_ingest_documents
+
+doc_id = ingest_document("docs://readme", "... document text ...")
+
+doc_ids = bulk_ingest_documents([
+    {"source_uri": "docs://a", "content": "..."},
+    {"source_uri": "docs://b", "content": "...", "metadata": {"tag": "x"}},
+])
+```
+
+Both read `$DATABASE_URL` and `$EMBEDDING_BACKEND` from the environment
+(via `db.get_connection()`/`embeddings.factory.get_provider()`) rather than
+taking them as arguments — set them (or use the `local_ingest_env` pytest
+fixture in tests) before calling either function.
+
+**Idempotency: upsert by `source_uri`.** A document is identified by its
+`source_uri`, not a caller-supplied id. Ingesting the same `source_uri`
+again updates the existing `documents` row's `content`/`metadata` and
+**replaces** its chunks (old ones are deleted before the new content is
+re-embedded) — so re-ingesting a changed document never accumulates stale
+or duplicate chunks. If you want two logically-different documents stored
+side by side, give them different `source_uri`s.
+
+**Partial-batch failure: fail the whole call.** `bulk_ingest_documents`
+runs as a single transaction covering every document upsert, chunk
+delete, and chunk insert. If any `embed_documents` call fails partway
+through a large batch, the exception propagates and **nothing** from that
+call is written — not even the document upserts that happened earlier in
+the same call. This trades off "can't lose partial progress on a huge
+bulk job" for "never has to reason about a half-ingested batch" — simplest
+and safest, per the master plan's own warning that silent partial writes
+can quietly degrade search quality over time. Rerunning
+`bulk_ingest_documents` after a failure is safe (it's exactly the upsert
+path again) once the underlying issue (e.g. a rate limit) is resolved.
+
+**Why `embeddings_openai_small` isn't tested end-to-end yet:** Phase 2
+only created `embeddings_bge_small` (local-model-only, deliberately —
+see Phase 2's plan notes), and there's still no `OPENAI_API_KEY`. The
+OpenAI provider's row-building is unit-tested with a mocked API client
+(`test_ingest_row_building_works_for_the_openai_path` in
+`tests/test_embeddings_openai.py`), but ingesting for real with
+`EMBEDDING_BACKEND=openai` will fail with "relation
+embeddings_openai_small does not exist" until that table is added in a
+future migration.
 
 ## Load-testing `embeddings_bge_small` with synthetic data
 
