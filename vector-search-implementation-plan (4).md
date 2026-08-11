@@ -724,7 +724,7 @@ Pitfalls: forgetting that query-time embedding must use the same provider (and i
 
 ---
 
-### Phase 4 — Ingestion Pipeline
+### Phase 4 — Ingestion Pipeline ✅ DONE
 
 **Goal:** reliable text → chunk → embed → store pipeline, correct for both single-document and batched multi-document cases (§6, §6.1).
 
@@ -738,7 +738,15 @@ Tasks:
 
 Deliverables: `ingest.py`, `bulk_ingest.py`, chunking module, tests covering single-doc ingest, batch ingest across multiple documents, re-ingestion of updated content, and partial-batch-failure handling.
 
-Exit criteria: ingesting a representative sample of your real documents (not synthetic data) completes without errors, and spot-checking the DB shows the expected number of chunks per document with correctly attached `document_id`s (this is where the ID-tracking logic from §6.1 gets its real test).
+**Status: implemented** (2026-08-11). Delivered exactly the deliverables above, plus the two files §5 already specified but had never been built: `db.py` (`get_connection()` per §5) and `storage.py` (`table_name_for()` per §5.1, now a trivial `return provider.table_name` thanks to the Phase 3 fix). `chunking.py` implements a dependency-free recursive splitter (paragraph → sentence → whitespace → hard cutoff, character-based `chunk_size`/overlap) — no `nltk`/`spaCy`/`langchain`, a deliberate user decision to avoid new dependencies. `ingest.py`'s `ingest_document` and `bulk_ingest.py`'s `bulk_ingest_documents` both implement upsert-by-`source_uri` idempotency (re-ingesting a `source_uri` updates the row and replaces its chunks rather than accumulating duplicates) and fail-whole-call partial-failure handling — `bulk_ingest_documents` runs as a single transaction, so any embedding error anywhere rolls back everything from that call, including earlier document upserts, not just the failing batch. The `(document_id, chunk_id, chunk_text, embedding, model_id)` reattachment logic from §6.1 was factored into a small pure helper (`ingest._rows_for`), independently unit-tested with synthetic data, no DB or model required.
+
+A known, deliberate gap: `embeddings_openai_small` still doesn't exist as a real table (no `OPENAI_API_KEY` yet, consistent with Phase 3's scoping), so OpenAI's ingestion path is only unit-tested via a mocked API client proving correct row-building — not exercised end-to-end against Postgres. All real DB-write tests run against `local` + real Postgres instead.
+
+Tests: 3 new files (`tests/test_chunking.py`, `tests/test_ingest.py`, `tests/test_bulk_ingest.py`) plus one new test in `tests/test_embeddings_openai.py` — 41 tests pass, 1 correctly skipped (real OpenAI API, no key). The integration tests were **actually run** against real Postgres and the real local model: ingesting a realistic sample document produced the expected chunks with correct `document_id`s, re-ingesting the same `source_uri` with different content replaced the old chunks, and a fake-DB unit test confirmed the fail-whole-batch policy writes nothing — not even prior document upserts — when one embedding call in a multi-batch call raises. `ruff check .` is clean; every new function/method has full `Args:`/`Returns:`/`Raises:` docstrings.
+
+One follow-up refactor after this phase landed: `tests/conftest.py`'s `db_conn` fixture was updated to delegate to `db.get_connection()` (pointing `$DATABASE_URL` at `$TEST_DATABASE_URL` via `monkeypatch`) instead of duplicating the connect + `register_vector` logic — one canonical connection path for both application code and tests.
+
+Exit criteria: ingesting a representative sample of your real documents (not synthetic data) completes without errors, and spot-checking the DB shows the expected number of chunks per document with correctly attached `document_id`s (this is where the ID-tracking logic from §6.1 gets its real test). — **Met.** Automated as `@pytest.mark.integration` tests rather than manual spot-checking: `test_ingest_document_creates_expected_chunks` and `test_bulk_ingest_document_ids_and_chunk_counts` both query `embeddings_bge_small` directly after ingestion and assert exact chunk counts/`document_id`s.
 
 Pitfalls: chunk size/overlap tuned for one content type (e.g. long-form articles) can perform poorly on another (e.g. short structured records) — don't assume one chunking config fits all document types in your corpus.
 
